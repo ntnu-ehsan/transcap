@@ -1,301 +1,392 @@
-#%%
-import math
-import pandas as pd
-
-def estimate_transformers_flexible(
-    df,
-    S_base_MVA=100.0,
-    pf=0.95,
-    use_n_minus_one=False,
-    bank_phases=None,
-    xr_default=10.0,
-    transformer_options=None
-):
-    """
-    Estimate per-unit transformer impedances dynamically for 400/220 and 220/132 autotransformers.
-    - Automatically handles parallel units.
-    - Optionally enforces N–1.
-    - Optionally accounts for 3 single-phase banks.
-    - Allows user-specified transformer options.
-
-    Required columns:
-        ['transformer_id','bus0','bus1','voltage_bus0','voltage_bus1',
-         'Max_Active_Power','Max_Apparent_Power']
-    """
-
-    # Default data (Typical Standard Ratings (IEC range))
-    DEFAULT_OPTIONS = {
-        (400, 220): {'X_percent': 14.0, 'unit_sizes': [100, 160, 250, 315, 400, 500, 630, 800]},
-        (220, 132): {'X_percent': 12.0, 'unit_sizes': [100, 160, 200, 250, 315]}
-    }
-    options = transformer_options or DEFAULT_OPTIONS
-
-    def normalize_pair(v0, v1):
-        """Snap voltage levels to nominal 400/220/132."""
-        vhi, vlo = (v0, v1) if v0 >= v1 else (v1, v0)
-        def bucket(v):
-            if v >= 300: return 400
-            if v >= 170: return 220
-            if v >= 100: return 132
-            return int(round(v))
-        return bucket(vhi), bucket(vlo)
-
-    results = []
-
-    for _, r in df.iterrows():
-        v0, v1 = float(r['voltage_bus0']), float(r['voltage_bus1'])
-        vhi, vlo = normalize_pair(v0, v1)
-        kv_pair = (vhi, vlo)
-
-        # Transformer specs
-        spec = options.get(kv_pair, options.get((vhi, vlo), None))
-        if spec is None:
-            # fallback generic
-            spec = {'X_percent': 12.0, 'unit_sizes': [300, 500, 800, 1000]}
-        X_percent = spec['X_percent']
-        unit_sizes = spec['unit_sizes']
-
-        # Determine apparent power
-        if pd.notna(r['Max_Apparent_Power']) and r['Max_Apparent_Power'] > 0:
-            S_req = float(r['Max_Apparent_Power'])
-        elif pd.notna(r['Max_Active_Power']) and r['Max_Active_Power'] > 0:
-            S_req = float(r['Max_Active_Power']) / pf
-        else:
-            S_req = 0.0
-
-        # Account for banks (if given)
-        bank_factor = bank_phases if bank_phases else 1.0
-
-        # Try each available unit size and pick the minimal total capacity
-        best = None
-        for S_unit_raw in unit_sizes:
-            S_unit = S_unit_raw * bank_factor  # total MVA per bank or 3-phase unit
-            if S_unit <= 0:
-                continue
-
-            # choose number of units
-            if use_n_minus_one:
-                n_units = math.ceil(S_req / S_unit) + 1
-            else:
-                n_units = math.ceil(S_req / S_unit)
-            n_units = max(1, n_units)
-
-            total_capacity = n_units * S_unit
-            if total_capacity >= S_req:
-                best = (n_units, S_unit_raw)
-                break
-        if best is None:
-            # if even largest unit too small, take the largest
-            best = (math.ceil(S_req / (unit_sizes[-1]*bank_factor)), unit_sizes[-1])
-
-        n_units, S_unit_raw = best
-        S_unit_total = S_unit_raw * bank_factor
-
-        # Per-unit impedance
-        X_pu = (X_percent / 100.0) * (S_base_MVA / (n_units * S_unit_total))
-        R_pu = X_pu / xr_default
-        tap = (v0 / v1) if v1 > 0 else 1.0
-
-        out = dict(r)
-        out.update({
-            'type': 'autotransformer',
-            'kv_high': vhi,
-            'kv_low': vlo,
-            'X_percent_nameplate': X_percent,
-            'n_units': int(n_units),
-            'unit_MVA': float(S_unit_raw),
-            'bank_phases': bank_phases if bank_phases else 3,
-            'X_pu': float(X_pu),
-            'R_pu': float(R_pu),
-            'tap': float(tap),
-            'S_req': float(S_req),
-        })
-        results.append(out)
-
-    return pd.DataFrame(results)
 
 #%% 
 # Importing transformer data
-if __name__ == "__main__":
-    substations = pd.read_csv('data/transformers_with_max_flows.csv')
-    transformers = estimate_transformers_flexible(
-        substations,
-        S_base_MVA=1000.0,
-        pf=0.95,
-        use_n_minus_one=True,
-        bank_phases=3
-    )
-
-# %%
 import pandas as pd
 from typing import Dict, Iterable, Tuple, Optional
 
-# ---- Configuration (your catalogs) ----
+# Works with both legacy and PyPSA-style inputs.
+INPUT_CSV = "data/pypsa_eur_transformers.csv"
+
+# %%
+import math
+import pandas as pd
+from typing import Dict, Iterable, Tuple, Optional
+import re
+
+
+# ---- Catalogs (MVA per transformer) ----
 CATALOG: Dict[Tuple[int, int], Iterable[int]] = {
-    (400, 220): [100, 160, 250, 315, 400, 500, 630, 800,1000],
-    (220, 132): [100, 160, 200, 250, 315],
+    (400, 220): [100, 160, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500],
+    (220, 132): [100, 160, 200, 250, 315, 400, 500, 630],
+    (225, 220): [100, 160, 200, 250, 315, 400, 500],
+    (400, 320): [250, 315, 400, 500, 630, 800, 1000, 1250, 1600]
 }
 
-def normalize_voltage_pair(v0: float, v1: float) -> Optional[Tuple[int, int]]:
-    """ 
-    Return a normalized (HV, LV) integer kV tuple that matches the catalog keys,
-    or None if unsupported. Works regardless of which side is bus0/bus1.
+
+# ---- HV-side reactance lookup (per-unit on single-transformer base) ----
+HV_XPU = {
+    400: 0.14,
+    225: 0.12,
+    220: 0.12,
+}
+
+# Voltage bucketing for mixed-grid datasets (e.g., PyPSA-Europe).
+# Values are snapped to these nominal levels before catalog lookup.
+def snap_voltage_kv(v_kv: float) -> int:
+    v = float(v_kv)
+    if 360 <= v <= 420:
+        return 400
+    if 210 <= v <= 240:
+        return 220
+    if 290 <= v <= 340:
+        return 320
+    return int(round(v))
+
+def _parse_quality_score(df: pd.DataFrame) -> float:
+    """Higher score means columns look correctly aligned and numeric where expected."""
+    score = 0.0
+    for c in ("voltage_bus0", "voltage_bus1"):
+        if c in df.columns:
+            score += float(pd.to_numeric(df[c], errors="coerce").notna().mean())
+
+    for c in ("s_max", "s_nom", "Max_Apparent_Power", "Max_Active_Power"):
+        if c in df.columns:
+            score += float(pd.to_numeric(df[c], errors="coerce").notna().mean())
+
+    # Penalize obvious mis-parse pattern where geometry text spills into power columns.
+    for c in ("s_max", "s_nom", "Max_Apparent_Power"):
+        if c in df.columns:
+            as_str = df[c].astype(str)
+            if as_str.str.contains("LINESTRING", na=False).any():
+                score -= 5.0
+    return score
+
+def read_transformer_csv(path: str) -> pd.DataFrame:
     """
-    hv, lv = sorted((round(v0), round(v1)), reverse=True)
+    Robust CSV reader for both:
+      - normal CSV (default parser),
+      - single-quoted geometry fields that contain commas.
+    """
+    df_default = pd.read_csv(path)
+    df_single_quote = pd.read_csv(path, quotechar=chr(39), engine="python")
+    return df_single_quote if _parse_quality_score(df_single_quote) > _parse_quality_score(df_default) else df_default
+
+def infer_smax_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a unified apparent-power column named `Smax_MVA_input` exists.
+    Priority:
+      1) s_max
+      2) s_nom
+      3) Max_Apparent_Power
+      4) sqrt(Max_Active_Power^2 + Max_Reactive_Power^2)
+    """
+    out = df.copy()
+    cols = set(out.columns)
+
+    if "s_max" in cols:
+        out["Smax_MVA_input"] = pd.to_numeric(out["s_max"], errors="coerce")
+        return out
+
+    if "s_nom" in cols:
+        out["Smax_MVA_input"] = pd.to_numeric(out["s_nom"], errors="coerce")
+        return out
+
+    if "Max_Apparent_Power" in cols:
+        out["Smax_MVA_input"] = pd.to_numeric(out["Max_Apparent_Power"], errors="coerce")
+        return out
+
+    if {"Max_Active_Power", "Max_Reactive_Power"}.issubset(cols):
+        p = pd.to_numeric(out["Max_Active_Power"], errors="coerce")
+        q = pd.to_numeric(out["Max_Reactive_Power"], errors="coerce")
+        out["Smax_MVA_input"] = (p.pow(2) + q.pow(2)).pow(0.5)
+        return out
+
+    raise ValueError(
+        "Input file must contain one of: `s_max`, `s_nom`, `Max_Apparent_Power`, "
+        "or both `Max_Active_Power` and `Max_Reactive_Power`."
+    )
+
+def normalize_voltage_pair(v0_kv: float, v1_kv: float) -> Optional[Tuple[int, int]]:
+    """Normalize to (HV, LV) integer kV and check against catalog keys."""
+    hv, lv = sorted((snap_voltage_kv(v0_kv), snap_voltage_kv(v1_kv)), reverse=True)
     key = (int(hv), int(lv))
     return key if key in CATALOG else None
 
-def choose_transformers_for_Smax(
+def parse_linestring_endpoints(geometry: object) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Parse a WKT LINESTRING and return (x0, y0, x1, y1) for first and last points.
+    Returns Nones when geometry is missing/invalid.
+    """
+    if geometry is None or (isinstance(geometry, float) and pd.isna(geometry)):
+        return None, None, None, None
+
+    text = str(geometry).strip()
+    if not text.upper().startswith("LINESTRING"):
+        return None, None, None, None
+
+    pairs = re.findall(r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", text)
+    if len(pairs) < 2:
+        return None, None, None, None
+
+    x0, y0 = map(float, pairs[0])
+    x1, y1 = map(float, pairs[-1])
+    return x0, y0, x1, y1
+
+def min_units_for_rating(Smax_MVA: float, R: float, k_emer: float) -> int:
+    """Minimal n (>=2) satisfying n*R >= Smax and (n-1)*k_emer*R >= Smax."""
+    if R <= 0 or Smax_MVA <= 0:
+        return math.inf
+    n_normal = math.ceil(Smax_MVA / R)
+    n_n1 = math.ceil(1 + Smax_MVA / (k_emer * R))
+    return max(2, n_normal, n_n1)
+
+def required_rating_for_n(Smax_MVA: float, n: int, k_emer: float) -> float:
+    """Per-unit rating R needed for a given n to satisfy both constraints."""
+    if n < 2:
+        return math.inf
+    return max(Smax_MVA / n, Smax_MVA / ((n - 1) * k_emer))
+
+def choose_by_rating_first(
     Smax_MVA: float,
     catalog_MVA: Iterable[int],
-    n_candidates: Iterable[int] = (2, 3),
     k_emer: float = 1.25,
-) -> Optional[dict]:
-    """
-    Given a peak apparent power Smax (MVA), a catalog of per-unit ratings (MVA),
-    and N-1 emergency factor k_emer, return the lowest-total-MVA feasible choice.
+    max_n: int = 3,
+) -> dict:
+    """Select feasible option with minimal n first, then minimal installed MVA."""
+    feasible_best = None
+    cat_sorted = sorted(catalog_MVA)
 
-    Constraint for identical units:
-        Normal:   n * R >= Smax
-        N-1:     (n-1) * k_emer * R >= Smax
-    => R_req(n) = max(Smax/n, Smax/((n-1)*k_emer)), n >= 2
-    """
-    best = None
+    for R in cat_sorted:
+        n = min_units_for_rating(Smax_MVA, R, k_emer)
+        if n <= max_n:
+            installed = n * R
+            candidate = {
+                "status": "OK",
+                "n": n,
+                "per_unit_MVA": R,
+                "installed_MVA": installed,
+                "required_per_unit_MVA": R,
+                "normal_margin_MVA": installed - Smax_MVA,
+                "n1_margin_MVA": (n - 1) * k_emer * R - Smax_MVA,
+            }
+            if (feasible_best is None or
+                candidate["n"] < feasible_best["n"] or
+                (candidate["n"] == feasible_best["n"] and candidate["installed_MVA"] < feasible_best["installed_MVA"]) or
+                (candidate["n"] == feasible_best["n"] and candidate["installed_MVA"] == feasible_best["installed_MVA"] and candidate["per_unit_MVA"] < feasible_best["per_unit_MVA"])):
+                feasible_best = candidate
 
-    for n in n_candidates:
-        if n < 2:
-            continue  # N-1 requires at least 2 units
+    if feasible_best is not None:
+        return feasible_best
 
-        # Required per-unit rating to satisfy both constraints
-        R_req = max(Smax_MVA / n, Smax_MVA / ((n - 1) * k_emer))
-
-        # Pick the smallest catalog rating meeting R_req
-        feasible = [R for R in catalog_MVA if R >= R_req]
-        if not feasible:
-            continue
-        R_pick = min(feasible)
-
-        # Calculate simple margins
-        normal_margin = n * R_pick - Smax_MVA
-        n1_margin = (n - 1) * k_emer * R_pick - Smax_MVA
-
-        candidate = {
-            "n": n,
-            "per_unit_MVA": R_pick,
-            "installed_MVA": n * R_pick,
-            "required_per_unit_MVA": R_req,
-            "normal_margin_MVA": normal_margin,
-            "n1_margin_MVA": n1_margin,
-        }
-
-        # Choose the candidate with the smallest installed MVA;
-        # tie-breaker: fewer units, then smaller per-unit rating.
-        if (best is None or
-            candidate["installed_MVA"] < best["installed_MVA"] or
-            (candidate["installed_MVA"] == best["installed_MVA"] and candidate["n"] < best["n"]) or
-            (candidate["installed_MVA"] == best["installed_MVA"] and candidate["n"] == best["n"] and candidate["per_unit_MVA"] < best["per_unit_MVA"])
-        ):
-            best = candidate
-
-    return best  # None means no catalog rating can satisfy N-1 for this Smax
+    # infeasible diagnostic at n = max_n
+    R_need_at_max_n = required_rating_for_n(Smax_MVA, max_n, k_emer)
+    biggest_catalog = cat_sorted[-1] if cat_sorted else None
+    short = (R_need_at_max_n - biggest_catalog) if biggest_catalog is not None else None
+    return {
+        "status": "INFEASIBLE_MAX_N",
+        "n": None,
+        "per_unit_MVA": None,
+        "installed_MVA": None,
+        "required_per_unit_MVA": R_need_at_max_n,
+        "normal_margin_MVA": None,
+        "n1_margin_MVA": None,
+        "note": (
+            f"Need per-unit >= {R_need_at_max_n:.3f} MVA for n={max_n} but catalog max is {biggest_catalog} "
+            f"(short by {short:.3f} MVA)." if short is not None else
+            f"Need per-unit >= {R_need_at_max_n:.3f} MVA for n={max_n}."
+        ),
+    }
 
 def size_substations_for_Nminus1(
     substations: pd.DataFrame,
-    n_candidates: Iterable[int] = (2, 3),
     k_emer: float = 1.25,
-    use_column: str = "Max_Apparent_Power",
+    use_column: str = "Smax_MVA_input",  # MVA
+    max_n: int = 3,                           # ≤ 3 transformers
+    system_base_MVA: float = 1000.0,           # load-flow system base
 ) -> pd.DataFrame:
     """
-    Adds recommended N-1 configuration columns for each substation row.
-
-    Parameters
-    ----------
-    substations : DataFrame with columns
-        ['transformer_id','bus0','bus1','voltage_bus0','voltage_bus1',
-         'Max_Active_Power','Max_Apparent_Power']
-    n_candidates : iterable of ints, e.g., (2,3)
-    k_emer : float, emergency short-time loading multiplier
-    use_column : 'Max_Apparent_Power' (default) or 'Max_Active_Power' if you must
-
-    Returns
-    -------
-    DataFrame with appended columns:
-        - voltage_pair_key
-        - catalog_used
-        - n_recommended
-        - per_unit_MVA
-        - installed_MVA
-        - required_per_unit_MVA
-        - normal_margin_MVA
-        - n1_margin_MVA
-        - status  (OK / UNSUPPORTED_VOLTAGE / INFEASIBLE_NEED_HIGHER_RATING)
+    Rating-first N-1 sizing (n <= max_n) + equivalent short-circuit reactance.
+    Adds columns:
+      - X_pu_on_installed_base
+      - X_pu_on_system_base (system_base_MVA)
+      - X_ohm_HV
     """
-    rows = []
+    out = []
     for _, r in substations.iterrows():
-        key = normalize_voltage_pair(r["voltage_bus0"], r["voltage_bus1"])
-        Smax = float(r[use_column])
+        v0 = float(r["voltage_bus0"])
+        v1 = float(r["voltage_bus1"])
+        hv_kv = int(round(max(v0, v1)))
+        hv_kv_lookup = snap_voltage_kv(max(v0, v1))
+        lv_kv = min(v0, v1)
+        key = normalize_voltage_pair(v0, v1)
+        Smax = float(r[use_column]) if pd.notna(r[use_column]) else None
+        x0, y0, x1, y1 = parse_linestring_endpoints(r.get("geometry"))
+        hv_on_bus0 = v0 >= v1
+        hv_bus = r["bus0"] if hv_on_bus0 else r["bus1"]
+        lv_bus = r["bus1"] if hv_on_bus0 else r["bus0"]
+        hv_x = x0 if hv_on_bus0 else x1
+        hv_y = y0 if hv_on_bus0 else y1
+        lv_x = x1 if hv_on_bus0 else x0
+        lv_y = y1 if hv_on_bus0 else y0
 
-        out = {
+        base = {
             "transformer_id": r["transformer_id"],
             "bus0": r["bus0"],
             "bus1": r["bus1"],
-            "voltage_bus0": r["voltage_bus0"],
-            "voltage_bus1": r["voltage_bus1"],
+            "voltage_bus0": v0,
+            "voltage_bus1": v1,
+            "voltage_pair_key": key,
+            "HV_kV": hv_kv,
+            "HV_kV_lookup": hv_kv_lookup,
             "Smax_MVA": Smax,
+            "k_emer": k_emer,
+            "max_units": max_n,
+            "system_base_MVA": system_base_MVA,
+            "geometry": r.get("geometry"),
+            "bus0_x": x0,
+            "bus0_y": y0,
+            "bus1_x": x1,
+            "bus1_y": y1,
+            "hv_bus": hv_bus,
+            "lv_bus": lv_bus,
+            "hv_x": hv_x,
+            "hv_y": hv_y,
+            "lv_x": lv_x,
+            "lv_y": lv_y,
         }
 
-        if key is None:
-            out.update({
-                "voltage_pair_key": None,
-                "catalog_used": None,
+        if key is None or Smax is None or Smax <= 0:
+            base.update({
+                "catalog_used": list(CATALOG.get(key, [])) if key else None,
                 "n_recommended": None,
                 "per_unit_MVA": None,
                 "installed_MVA": None,
+                "installed_to_Smax_ratio": None,
                 "required_per_unit_MVA": None,
                 "normal_margin_MVA": None,
                 "n1_margin_MVA": None,
-                "status": "UNSUPPORTED_VOLTAGE",
+                "status": "BAD_INPUT" if (Smax is None or Smax <= 0) else "UNSUPPORTED_VOLTAGE",
+                "note": None,
+                "X_pu_on_installed_base": None,
+                "X_pu_on_system_base": None,
+                "X_ohm_HV": None,
+                "X_ohm_LV": None
             })
-        else:
-            choice = choose_transformers_for_Smax(
-                Smax_MVA=Smax,
-                catalog_MVA=CATALOG[key],
-                n_candidates=n_candidates,
-                k_emer=k_emer,
-            )
-            if choice is None:
-                out.update({
-                    "voltage_pair_key": key,
-                    "catalog_used": list(CATALOG[key]),
-                    "n_recommended": None,
-                    "per_unit_MVA": None,
-                    "installed_MVA": None,
-                    "required_per_unit_MVA": max(
-                        Smax / min(n_candidates),
-                        Smax / ((min(n_candidates) - 1) * k_emer)
-                    ) if min(n_candidates) >= 2 else None,
-                    "normal_margin_MVA": None,
-                    "n1_margin_MVA": None,
-                    "status": "INFEASIBLE_NEED_HIGHER_RATING",
-                })
-            else:
-                out.update({
-                    "voltage_pair_key": key,
-                    "catalog_used": list(CATALOG[key]),
-                    "n_recommended": choice["n"],
-                    "per_unit_MVA": choice["per_unit_MVA"],
-                    "installed_MVA": choice["installed_MVA"],
-                    "required_per_unit_MVA": choice["required_per_unit_MVA"],
-                    "normal_margin_MVA": choice["normal_margin_MVA"],
-                    "n1_margin_MVA": choice["n1_margin_MVA"],
-                    "status": "OK",
-                })
-        rows.append(out)
+            out.append(base)
+            continue
 
-    return pd.DataFrame(rows)
+        choice = choose_by_rating_first(
+            Smax_MVA=Smax,
+            catalog_MVA=CATALOG[key],
+            k_emer=k_emer,
+            max_n=max_n,
+        )
+
+        if choice["status"] != "OK":
+            base.update({
+                "catalog_used": list(CATALOG[key]),
+                "n_recommended": None,
+                "per_unit_MVA": None,
+                "installed_MVA": None,
+                "installed_to_Smax_ratio": None,
+                "required_per_unit_MVA": choice["required_per_unit_MVA"],
+                "normal_margin_MVA": None,
+                "n1_margin_MVA": None,
+                "status": choice["status"],
+                "note": choice.get("note"),
+                "X_pu_on_installed_base": None,
+                "X_pu_on_system_base": None,
+                "X_ohm_HV": None,
+                "X_ohm_LV": None
+            })
+            out.append(base)
+            continue
+
+        # Sizing details
+        n = choice["n"]
+        R = choice["per_unit_MVA"]
+        installed = choice["installed_MVA"]
+        ratio = installed / Smax if Smax else None
+
+        # HV-side unit reactance (p.u. on single-transformer base)
+        X_unit_pu = HV_XPU.get(hv_kv_lookup, None)
+
+        if X_unit_pu is None:
+            # Unknown HV voltage → no reactance estimate
+            X_pu_installed = None
+            X_pu_system = None
+            X_ohm_HV = None
+            X_ohm_LV = None
+            note_extra = f"No Xpu rule for HV={hv_kv} kV (lookup class {hv_kv_lookup} kV)."
+        else:
+            # Parallel identical units:
+            # - On installed base (n*R): X_pu is same as unit p.u.
+            X_pu_installed = X_unit_pu
+            # - On system base: scale by 100 MVA base (or user base)
+            X_pu_system = X_unit_pu * (system_base_MVA / (n * R))
+            # - In ohms on HV side: X = X_pu * (V_kV^2 / S_MVA) with n in parallel
+            #   -> equivalent ohms = (X_unit_pu * V^2 / R) / n
+            X_ohm_HV = X_unit_pu * (hv_kv ** 2) / (R * n)
+
+            # Compute LV-side reactance (ohms)
+            X_ohm_LV = X_ohm_HV * (lv_kv / hv_kv) ** 2
+            note_extra = None
+
+        base.update({
+            "catalog_used": list(CATALOG[key]),
+            "n_recommended": n,
+            "per_unit_MVA": R,
+            "installed_MVA": installed,
+            "installed_to_Smax_ratio": ratio,
+            "required_per_unit_MVA": choice["required_per_unit_MVA"],
+            "normal_margin_MVA": choice["normal_margin_MVA"],
+            "n1_margin_MVA": choice["n1_margin_MVA"],
+            "status": "OK",
+            "note": note_extra,
+            # Reactance outputs
+            "X_pu_on_installed_base": X_pu_installed,
+            "X_pu_on_system_base": X_pu_system,
+            "X_ohm_HV": X_ohm_HV,
+            "X_ohm_LV": X_ohm_LV
+        })
+        out.append(base)
+
+    return pd.DataFrame(out)
+
+
 
 
 # %%
-result = size_substations_for_Nminus1(substations, n_candidates=(2,3,4), k_emer=1.25)
-print(result)
+substations = read_transformer_csv(INPUT_CSV)
+substations = infer_smax_column(substations)
+
+# %%
+result = size_substations_for_Nminus1(
+    substations,
+    k_emer=1.25,                 # your emergency loading factor
+    use_column="Smax_MVA_input",  # MVA
+    max_n=3                      # <= 3 transformers
+)
+# %%
+result.to_csv('data/transformers_reactance.csv', index=False)
+
+# %%
+
+import pandas as pd
+
+df = pd.read_csv('data/transformers_reactance.csv')
+# assuming df is your DataFrame
+df["X_ohm_LV"] = df.apply(
+    lambda r: r["X_ohm_HV"] * (min(r["voltage_bus0"], r["voltage_bus1"]) / r["HV_kV"]) ** 2
+    if pd.notna(r["X_ohm_HV"]) and pd.notna(r["voltage_bus0"]) and pd.notna(r["voltage_bus1"])
+    else None,
+    axis=1
+)
+
+try:
+    df.to_csv("data/pypsa_transformers_reactance_HL.csv", index=False)
+except PermissionError:
+    # Common when file is open in Excel/IDE preview.
+    df.to_csv("data/pypsa_transformers_reactance_HL_new.csv", index=False)
+
 # %%
